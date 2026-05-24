@@ -1,0 +1,192 @@
+name: Devin npm audit remediation
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_findings:
+        description: "Maximum eligible findings to send to Devin"
+        required: false
+        default: "1"
+      min_severity:
+        description: "Minimum severity to send"
+        required: false
+        default: "high"
+        type: choice
+        options:
+          - low
+          - medium
+          - high
+          - critical
+
+jobs:
+  npm-audit:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout Superset fork
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.22.0"
+
+      - name: Run npm audit
+        id: audit
+        working-directory: superset-frontend
+        shell: bash
+        run: |
+          set +e
+          npm audit --package-lock-only --json > audit.json 2> audit.stderr
+          exit_code=$?
+          set -e
+
+          echo "exit_code=$exit_code" >> "$GITHUB_OUTPUT"
+
+          if [ "$exit_code" -gt 1 ]; then
+            echo "npm audit exited with an infrastructure error: $exit_code"
+            cat audit.stderr
+          fi
+
+      - name: Normalize and post audit scan
+        working-directory: superset-frontend
+        env:
+          REMEDIATION_QUEUE_URL: ${{ secrets.REMEDIATION_QUEUE_URL }}
+          AUDIT_EXIT_CODE: ${{ steps.audit.outputs.exit_code }}
+          MAX_FINDINGS: ${{ github.event.inputs.max_findings || '1' }}
+          MIN_SEVERITY: ${{ github.event.inputs.min_severity || 'high' }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs");
+
+          const severityRank = { low: 0, medium: 1, high: 2, critical: 3 };
+          const minSeverity = process.env.MIN_SEVERITY || "high";
+          const maxFindings = Number(process.env.MAX_FINDINGS || 1);
+          const auditExitCode = Number(process.env.AUDIT_EXIT_CODE || 0);
+          const [owner, name] = process.env.GITHUB_REPOSITORY.split("/");
+          const repoUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}`;
+
+          const readJson = path => {
+            try {
+              return JSON.parse(fs.readFileSync(path, "utf8"));
+            } catch (error) {
+              return null;
+            }
+          };
+
+          const audit = readJson("audit.json");
+          const stderr = fs.existsSync("audit.stderr")
+            ? fs.readFileSync("audit.stderr", "utf8").trim()
+            : "";
+
+          const advisoriesFromVia = via => {
+            if (!Array.isArray(via)) return [];
+            return via.filter(item => item && typeof item === "object");
+          };
+
+          const toFinding = ([packageName, vulnerability]) => {
+            const advisories = advisoriesFromVia(vulnerability.via);
+            const primary = advisories[0] || {};
+            const severity = vulnerability.severity || primary.severity || "low";
+            const fixedAvailable = vulnerability.fixAvailable;
+            const fixedVersion =
+              fixedAvailable && typeof fixedAvailable === "object"
+                ? fixedAvailable.version
+                : null;
+            const requiresMajorUpgrade =
+              fixedAvailable && typeof fixedAvailable === "object"
+                ? Boolean(fixedAvailable.isSemVerMajor)
+                : false;
+
+            const advisoryId =
+              primary.id ||
+              primary.source ||
+              primary.url ||
+              `${packageName}-npm-audit`;
+
+            const aliases = [];
+            if (primary.cwe) aliases.push(...[].concat(primary.cwe));
+            if (primary.cvss && primary.cvss.vectorString) aliases.push(primary.cvss.vectorString);
+
+            return {
+              ecosystem: "npm",
+              packageName,
+              installedVersion: null,
+              vulnerableRange: vulnerability.range || null,
+              fixedVersions: fixedVersion ? [fixedVersion] : [],
+              advisoryId: String(advisoryId),
+              aliases,
+              severity,
+              title: primary.title || `${packageName} vulnerability`,
+              summary: primary.title || `${packageName} vulnerability reported by npm audit.`,
+              advisoryUrl: primary.url || null,
+              manifestPath: "superset-frontend/package-lock.json",
+              dependencyPath: packageName,
+              isDevDependency: false,
+              requiresMajorUpgrade,
+              raw: vulnerability,
+            };
+          };
+
+          const vulnerabilities = audit && audit.vulnerabilities
+            ? Object.entries(audit.vulnerabilities)
+            : [];
+
+          const findings = vulnerabilities
+            .map(toFinding)
+            .filter(finding => severityRank[finding.severity] >= severityRank[minSeverity])
+            .sort((a, b) => {
+              const severityDelta = severityRank[b.severity] - severityRank[a.severity];
+              if (severityDelta !== 0) return severityDelta;
+              if (a.requiresMajorUpgrade !== b.requiresMajorUpgrade) {
+                return a.requiresMajorUpgrade ? 1 : -1;
+              }
+              return a.packageName.localeCompare(b.packageName);
+            })
+            .slice(0, maxFindings);
+
+          const payload = {
+            source: "github_actions",
+            scanner: "npm_audit",
+            repo: {
+              owner,
+              name,
+              url: repoUrl,
+              branch: process.env.GITHUB_REF_NAME,
+              commitSha: process.env.GITHUB_SHA,
+            },
+            command: "npm audit --package-lock-only --json",
+            exitCode: auditExitCode,
+            status: auditExitCode > 1 ? "failed" : "completed",
+            startedAt: new Date().toISOString(),
+            completedAt: new Date().toISOString(),
+            error: auditExitCode > 1 ? stderr || `npm audit exited with ${auditExitCode}` : null,
+            summary: audit && audit.metadata ? audit.metadata : null,
+            findings,
+          };
+
+          const endpoint = `${process.env.REMEDIATION_QUEUE_URL.replace(/\/$/, "")}/webhooks/audit-scan`;
+
+          fetch(endpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          }).then(async response => {
+            const body = await response.text();
+            console.log(body);
+            if (!response.ok) {
+              throw new Error(`${response.status} ${response.statusText}: ${body}`);
+            }
+          }).catch(error => {
+            console.error(error);
+            process.exitCode = 1;
+          });
+          NODE
